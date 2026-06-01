@@ -1,11 +1,12 @@
 import math
+import csv
 import numpy as np
 import networkx as nx
 from sentence_transformers import SentenceTransformer
 
 
 DEFAULT_MODEL = SentenceTransformer(
-    "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    "all-MiniLM-L6-v2"
 )
 
 
@@ -69,17 +70,6 @@ def cer(
         chunks = [chunk.lower() for chunk in chunks]
 
     return sum(concept_title in chunk for chunk in chunks)
-
-
-def transitive_reduce(g: nx.DiGraph) -> nx.DiGraph:
-    if not nx.is_directed_acyclic_graph(g):
-        return g
-    reduced = nx.transitive_reduction(g)
-    out = nx.DiGraph()
-    out.add_nodes_from(g.nodes())
-    out.add_edges_from(reduced.edges())
-    return out
-
 
 def ask_expert(topic_a: str, topic_b: str, score_ab: float, score_ba: float, prs: float, mode: str) -> int:
     print("\n" + "=" * 80)
@@ -214,7 +204,7 @@ def run_ace(
         else:
             g.add_edge(b, a)
 
-        g = transitive_reduce(g)
+        g = nx.transitive_reduction(g)
 
     return g, ranked_pairs, pair_scores
 
@@ -226,12 +216,19 @@ def print_graph(g: nx.DiGraph):
         print(f"{u} -> {v}")
     print("=" * 80)
 
+def save_graph(g: nx.DiGraph, file_path: str = "ace_graph.csv"):
+    with open(file_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["source", "target"])
+        writer.writerows(g.edges())
+
 # ======================================================================
-# ====================== ДАЛЕЕ ТЕСТИРУЮЩАЯ ЧАСТЬ =======================
+# ====================== РАБОЧАЯ ЧАСТЬ С ЗАПУСКОМ =======================
 # ======================================================================
 
 import os
 import re
+import csv
 import pandas as pd
 
 
@@ -256,34 +253,20 @@ def load_example(
     return df, topic_to_text
 
 
-def test_on_csv(
-    csv_file="EKG-Dataset-main\0-100.csv",
-    descriptions_dir="EKG-Dataset-main\concept_descriptions",
+def save_graph(
+    g: nx.DiGraph,
+    edges_file: str = "ace_graph_edges.csv",
+    nodes_file: str = "ace_graph_nodes.csv",
 ):
-    df, topic_to_text = load_example(csv_file, descriptions_dir)
+    pd.DataFrame({"concept": list(g.nodes())}).to_csv(nodes_file, index=False, encoding="utf-8-sig")
+    pd.DataFrame(list(g.edges()), columns=["source", "target"]).to_csv(edges_file, index=False, encoding="utf-8-sig")
 
-    ranked_pairs, pair_scores = build_ranked_pairs(
-        topic_to_text=topic_to_text,
-        mode="csr",
-        model=DEFAULT_MODEL,
-        n=10,
-        step=10,
-    )
-
-    calc = {
-        tuple(sorted((a, b))): max(score_ab, score_ba)
-        for _, a, b in ranked_pairs
-        for score_ab, score_ba in [pair_scores[(a, b)]]
-    }
-
-    df["calculated_csr_score"] = [
-        calc[tuple(sorted((row["concept1"], row["concept2"])))]
-        for _, row in df.iterrows()
-    ]
-    df["abs_diff"] = (df["calculated_csr_score"] - df["csr_score"]).abs()
-
-    print("\nСравнение с датасетом:\n")
-    print(df[["concept1", "concept2", "csr_score", "calculated_csr_score", "abs_diff"]].to_string(index=False))
+def run_from_csv(
+    csv_file="C:\\Users\\timofey\\YandexDisk\\Code\\thesis\\EKG-Dataset-main\\0-100.csv",
+    descriptions_dir="C:\\Users\\timofey\\YandexDisk\\Code\\thesis\\EKG-Dataset-main\\concept_descriptions",
+    output_file="ace_graph.csv",
+):
+    _, topic_to_text = load_example(csv_file, descriptions_dir)
 
     graph, _, _ = run_ace(
         topic_to_text=topic_to_text,
@@ -294,10 +277,9 @@ def test_on_csv(
         top_t_percent=100.0,
     )
 
-    print("\nМинимальный граф:\n")
-    for u, v in graph.edges():
-        print(f"{u} -> {v}")
+    save_graph(graph, output_file)
+    print_graph(graph)
 
 
 if __name__ == "__main__":
-    test_on_csv()
+    run_from_csv()
