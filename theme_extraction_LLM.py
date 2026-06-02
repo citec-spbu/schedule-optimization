@@ -1,8 +1,11 @@
 import json
-import uuid
-import re
 import os
+import re
 import time
+import uuid
+from pathlib import Path
+from typing import Any
+
 import requests
 from openai import OpenAI
 
@@ -10,19 +13,28 @@ from openai import OpenAI
 # =========================
 # 1. НАСТРОЙКИ
 # =========================
+
 AUTH_KEY_ENV_NAME = "GIGACHAT_AUTH_KEY"
 
-INPUT_JSON_PATH = "RPD_SPBU\\rpd_2_2.json"
-OUTPUT_JSON_PATH = "topics_all_courses.json"
-ERRORS_JSON_PATH = "topics_all_courses_errors.json"
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "extracted_data"
+
+INPUT_JSON_PATH = DATA_DIR / "rpd_2_2.json"
+OUTPUT_JSON_PATH = DATA_DIR / "educational_concepts.json"
+ERRORS_JSON_PATH = DATA_DIR / "educational_concepts_errors.json"
 
 MODEL_NAME = "GigaChat-2-Pro"
 REQUEST_DELAY_SECONDS = 0.5
+MAX_RETRIES = 3
+
+# None = обработать все курсы из INPUT_JSON_PATH.
+COURSES_TO_PROCESS: list[str] | None = None
 
 
 # =========================
 # 2. ЧТЕНИЕ AUTH KEY ИЗ ОКРУЖЕНИЯ
 # =========================
+
 def get_auth_key_from_env(env_name: str = AUTH_KEY_ENV_NAME) -> str:
     auth_key = os.getenv(env_name)
 
@@ -45,6 +57,7 @@ def get_auth_key_from_env(env_name: str = AUTH_KEY_ENV_NAME) -> str:
 # =========================
 # 3. ПОЛУЧЕНИЕ ACCESS TOKEN
 # =========================
+
 def get_access_token(auth_key: str) -> str:
     token_url = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
 
@@ -56,7 +69,7 @@ def get_access_token(auth_key: str) -> str:
     }
 
     data = {
-        "scope": "GIGACHAT_API_PERS"
+        "scope": "GIGACHAT_API_PERS",
     }
 
     response = requests.post(token_url, headers=headers, data=data, timeout=30)
@@ -68,45 +81,96 @@ def get_access_token(auth_key: str) -> str:
 # =========================
 # 4. СОЗДАНИЕ КЛИЕНТА
 # =========================
+
 def create_client(auth_key: str) -> OpenAI:
     access_token = get_access_token(auth_key)
 
     return OpenAI(
         api_key=access_token,
-        base_url="https://gigachat.devices.sberbank.ru/api/v1"
+        base_url="https://gigachat.devices.sberbank.ru/api/v1",
     )
 
 
 # =========================
-# 5. ЗАГРУЗКА ВСЕХ КУРСОВ ИЗ JSON
+# 5. ЧТЕНИЕ И СОХРАНЕНИЕ JSON
 # =========================
-def load_courses(path: str) -> dict[str, str]:
-    with open(path, "r", encoding="utf-8") as f:
+
+def load_courses(path: str | Path) -> dict[str, str]:
+    path = Path(path)
+
+    if not path.exists():
+        raise FileNotFoundError(f"Файл не найден: {path}")
+
+    with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
 
     if not data:
         raise ValueError("JSON-файл пуст.")
 
     if not isinstance(data, dict):
-        raise TypeError("Ожидался JSON-объект формата: {название_курса: текст_курса}.")
+        raise TypeError(
+            "Ожидался JSON-объект формата: {название_курса: текст_курса}."
+        )
+
+    result: dict[str, str] = {}
+
+    for course_title, course_text in data.items():
+        if not isinstance(course_title, str):
+            continue
+
+        if not isinstance(course_text, str):
+            course_text = str(course_text)
+
+        course_title = course_title.strip()
+        course_text = course_text.strip()
+
+        if course_title and course_text:
+            result[course_title] = course_text
+
+    return result
+
+
+def load_existing_json(path: str | Path) -> dict:
+    path = Path(path)
+
+    if not path.exists():
+        return {}
+
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, dict):
+        return {}
 
     return data
 
 
-# =========================
-# 6. ЗАГРУЗКА УЖЕ СОХРАНЕННЫХ РЕЗУЛЬТАТОВ
-# =========================
-def load_existing_json(path: str) -> dict:
-    if not os.path.exists(path):
-        return {}
+def save_json(path: str | Path, data: dict) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
 # =========================
-# 7. ПОДГОТОВКА НЕПУСТЫХ СТРОК
+# 6. ПОДГОТОВКА ТЕКСТА
 # =========================
+
+def filter_courses(
+    courses: dict[str, str],
+    courses_to_process: list[str] | None = None,
+) -> dict[str, str]:
+    if courses_to_process is None:
+        return courses
+
+    return {
+        course: courses[course]
+        for course in courses_to_process
+        if course in courses
+    }
+
+
 def get_nonempty_lines(source_text: str) -> list[str]:
     return [
         line.strip()
@@ -116,8 +180,9 @@ def get_nonempty_lines(source_text: str) -> list[str]:
 
 
 # =========================
-# 8. SYSTEM PROMPT
+# 7. PROMPTS
 # =========================
+
 SYSTEM_PROMPT = """
 Ты извлекаешь из строк текста понятия, относящиеся к теме курса.
 
@@ -152,14 +217,11 @@ SYSTEM_PROMPT = """
 """.strip()
 
 
-# =========================
-# 9. USER PROMPT ДЛЯ ОДНОГО КУРСА
-# =========================
 def build_user_prompt(course_title: str, lines: list[str]) -> str:
     input_lines = [
         {
             "line_number": i,
-            "text": line
+            "text": line,
         }
         for i, line in enumerate(lines, start=1)
     ]
@@ -193,36 +255,76 @@ def build_user_prompt(course_title: str, lines: list[str]) -> str:
 
 
 # =========================
-# 10. ЗАПРОС К МОДЕЛИ
+# 8. ЗАПРОС К МОДЕЛИ
 # =========================
+
+def extract_json_object(raw_text: str) -> dict[str, Any]:
+    text = raw_text.strip()
+
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?", "", text, flags=re.IGNORECASE).strip()
+        text = re.sub(r"```$", "", text).strip()
+
+    start = text.find("{")
+    end = text.rfind("}")
+
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError(f"В ответе модели не найден JSON-объект: {raw_text[:500]}")
+
+    json_text = text[start:end + 1]
+    parsed = json.loads(json_text)
+
+    if not isinstance(parsed, dict):
+        raise ValueError("Ответ модели должен быть JSON-объектом.")
+
+    return parsed
+
+
 def extract_concepts_for_course(
     client: OpenAI,
     system_prompt: str,
-    user_prompt: str
-) -> dict:
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": user_prompt
-            }
-        ],
-        temperature=0
-    )
+    user_prompt: str,
+) -> dict[str, Any]:
+    last_error: Exception | None = None
 
-    raw_answer = response.choices[0].message.content.strip()
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": system_prompt,
+                    },
+                    {
+                        "role": "user",
+                        "content": user_prompt,
+                    },
+                ],
+                temperature=0,
+            )
 
-    return json.loads(raw_answer)
+            raw_answer = response.choices[0].message.content.strip()
+            return extract_json_object(raw_answer)
+
+        except Exception as error:
+            last_error = error
+
+            if attempt < MAX_RETRIES:
+                time.sleep(REQUEST_DELAY_SECONDS * attempt)
+                continue
+
+            raise RuntimeError(
+                f"Не удалось получить корректный ответ модели после {MAX_RETRIES} попыток."
+            ) from last_error
+
+    raise RuntimeError("Не удалось получить ответ модели.")
 
 
 # =========================
-# 11. НОРМАЛИЗАЦИЯ ПОНЯТИЙ
+# 9. НОРМАЛИЗАЦИЯ И ОБЪЕДИНЕНИЕ ПОНЯТИЙ
 # =========================
+
 def normalize_concept(text: str) -> str:
     text = text.strip().lower()
     text = text.replace("ё", "е")
@@ -234,14 +336,19 @@ def normalize_concept(text: str) -> str:
     return text
 
 
-# =========================
-# 12. ОБЪЕДИНЕНИЕ ПОНЯТИЙ
-# =========================
-def collect_concepts(parsed_response: dict) -> list[str]:
+def collect_concepts(parsed_response: dict[str, Any]) -> list[str]:
     result = []
     seen = set()
 
-    for item in parsed_response.get("lines", []):
+    lines = parsed_response.get("lines", [])
+
+    if not isinstance(lines, list):
+        raise ValueError('В ответе модели ключ "lines" должен быть списком.')
+
+    for item in lines:
+        if not isinstance(item, dict):
+            continue
+
         concepts = item.get("concepts", [])
 
         if not isinstance(concepts, list):
@@ -264,21 +371,14 @@ def collect_concepts(parsed_response: dict) -> list[str]:
 
 
 # =========================
-# 13. СОХРАНЕНИЕ JSON
+# 10. ОБРАБОТКА ВСЕХ КУРСОВ
 # =========================
-def save_json(output_path: str, data: dict) -> None:
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
 
-
-# =========================
-# 14. ОБРАБОТКА ВСЕХ КУРСОВ
-# =========================
 def process_all_courses(
     client: OpenAI,
     courses: dict[str, str],
-    output_path: str,
-    errors_path: str
+    output_path: str | Path,
+    errors_path: str | Path,
 ) -> None:
     results = load_existing_json(output_path)
     errors = load_existing_json(errors_path)
@@ -299,7 +399,7 @@ def process_all_courses(
             parsed = extract_concepts_for_course(
                 client=client,
                 system_prompt=SYSTEM_PROMPT,
-                user_prompt=user_prompt
+                user_prompt=user_prompt,
             )
 
             concepts = collect_concepts(parsed)
@@ -325,19 +425,21 @@ def process_all_courses(
 
 
 # =========================
-# 15. ОСНОВНОЙ ЗАПУСК
+# 11. ОСНОВНОЙ ЗАПУСК
 # =========================
+
 def main() -> None:
     auth_key = get_auth_key_from_env()
     client = create_client(auth_key)
 
     courses = load_courses(INPUT_JSON_PATH)
+    courses = filter_courses(courses, COURSES_TO_PROCESS)
 
     process_all_courses(
         client=client,
         courses=courses,
         output_path=OUTPUT_JSON_PATH,
-        errors_path=ERRORS_JSON_PATH
+        errors_path=ERRORS_JSON_PATH,
     )
 
 
