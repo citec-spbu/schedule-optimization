@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 import networkx as nx
 
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "extracted_data"
 
@@ -28,6 +29,7 @@ REQUIRED_CSR_COLUMNS = [
     "csr_description_b_to_concept_a",
     "prs",
 ]
+
 
 def load_json(path: str | Path) -> dict:
     """
@@ -106,53 +108,18 @@ def safe_filename(name: str) -> str:
 def get_course_topics_from_selected_concepts(
     course: str,
     selected_concepts_file: str | Path = SELECTED_CONCEPTS_FILE,
-) -> list[str] | None:
+) -> list[str]:
     """
-    Пытается получить полный список понятий курса из selected_concepts.json.
-    Если файл отсутствует или курса в нём нет, возвращает None.
+    Получает полный список понятий курса из selected_concepts.json.
     """
-    selected_concepts_file = Path(selected_concepts_file)
-
-    if not selected_concepts_file.exists():
-        return None
-
     selected_concepts = load_json(selected_concepts_file)
 
     if course not in selected_concepts:
-        return None
+        raise ValueError(
+            f"Курс {course!r} не найден в selected_concepts.json."
+        )
 
     return list(selected_concepts[course])
-
-
-def get_course_topics_from_csr(course_df: pd.DataFrame) -> list[str]:
-    """
-    Восстанавливает список понятий курса из csr_scores.csv.
-    """
-    topics = set(course_df["topic_a"]).union(set(course_df["topic_b"]))
-    return sorted(topics)
-
-
-def get_course_topics(
-    course: str,
-    course_df: pd.DataFrame,
-    selected_concepts_file: str | Path = SELECTED_CONCEPTS_FILE,
-) -> list[str]:
-    """
-    Возвращает список понятий курса.
-
-    Приоритет:
-    1. selected_concepts.json — сохраняет исходный порядок понятий;
-    2. csr_scores.csv — резервный вариант.
-    """
-    selected_topics = get_course_topics_from_selected_concepts(
-        course=course,
-        selected_concepts_file=selected_concepts_file,
-    )
-
-    if selected_topics is not None:
-        return selected_topics
-
-    return get_course_topics_from_csr(course_df)
 
 
 def ask_expert(
@@ -173,15 +140,16 @@ def ask_expert(
     print("Введите решение:")
     print(f"  0 -> {topic_a} prerequisite для {topic_b}   ({topic_a} -> {topic_b})")
     print(f"  1 -> {topic_b} prerequisite для {topic_a}   ({topic_b} -> {topic_a})")
-    print("  2 -> остановить разметку для текущего курса")
+    print("  2 -> между понятиями нет отношения prerequisite")
+    print("  3 -> остановить разметку для текущего курса")
 
     while True:
-        ans = input("Ваш выбор [0/1/2]: ").strip()
+        ans = input("Ваш выбор [0/1/2/3]: ").strip()
 
-        if ans in {"0", "1", "2"}:
+        if ans in {"0", "1", "2", "3"}:
             return int(ans)
 
-        print("Некорректный ввод. Нужно ввести 0, 1 или 2.")
+        print("Некорректный ввод. Нужно ввести 0, 1, 2 или 3.")
 
 
 def run_ace_for_course(
@@ -214,7 +182,8 @@ def run_ace_for_course(
         score_ab = float(row["csr_description_a_to_concept_b"])
         score_ba = float(row["csr_description_b_to_concept_a"])
 
-        # Если между вершинами уже есть путь в любую сторону, пара пропускается, чтобы не нарушать минимальность и не создавать цикл.
+        # Если между вершинами уже есть путь в любую сторону,
+        # пара пропускается.
         if nx.has_path(g, topic_a, topic_b) or nx.has_path(g, topic_b, topic_a):
             decision_rows.append({
                 "course": course,
@@ -237,7 +206,7 @@ def run_ace_for_course(
             prs=prs,
         )
 
-        if ans == 2:
+        if ans == 3:
             decision_rows.append({
                 "course": course,
                 "topic_a": topic_a,
@@ -251,6 +220,20 @@ def run_ace_for_course(
             })
             break
 
+        if ans == 2:
+            decision_rows.append({
+                "course": course,
+                "topic_a": topic_a,
+                "topic_b": topic_b,
+                "prs": prs,
+                "csr_description_a_to_concept_b": score_ab,
+                "csr_description_b_to_concept_a": score_ba,
+                "decision": "no_relation",
+                "source": "",
+                "target": "",
+            })
+            continue
+
         if ans == 0:
             source = topic_a
             target = topic_b
@@ -261,9 +244,6 @@ def run_ace_for_course(
             decision = "topic_b_to_topic_a"
 
         g.add_edge(source, target)
-
-        # После добавления ребра оставляем транзитивно сокращённый граф.
-        g = nx.transitive_reduction(g)
 
         decision_rows.append({
             "course": course,
@@ -276,6 +256,9 @@ def run_ace_for_course(
             "source": source,
             "target": target,
         })
+
+    # Транзитивная редукция выполняется один раз после завершения разметки.
+    g = nx.transitive_reduction(g)
 
     decisions_df = pd.DataFrame(
         decision_rows,
@@ -356,6 +339,7 @@ def print_graph(g: nx.DiGraph, course: str) -> None:
 
     print("=" * 80)
 
+
 def run_interactive_ace_from_csr(
     csr_input_file: str | Path = CSR_INPUT_FILE,
     selected_concepts_file: str | Path = SELECTED_CONCEPTS_FILE,
@@ -367,10 +351,11 @@ def run_interactive_ace_from_csr(
     Основной сценарий:
 
     1. Загрузить заранее рассчитанный csr_scores.csv.
-    2. Для каждого курса отсортировать пары по PRS.
-    3. Запустить интерактивную экспертную разметку.
-    4. Построить минимальный граф пререквизитов.
-    5. Сохранить nodes, edges и журнал экспертных решений.
+    2. Для каждого курса получить полный список понятий из selected_concepts.json.
+    3. Для каждого курса отсортировать пары по PRS.
+    4. Запустить интерактивную экспертную разметку.
+    5. Построить минимальный граф пререквизитов.
+    6. Сохранить nodes, edges и журнал экспертных решений.
     """
     csr_df = load_csr_scores(csr_input_file)
 
@@ -392,9 +377,8 @@ def run_interactive_ace_from_csr(
     for course in courses:
         course_df = csr_df[csr_df["course"] == course].copy()
 
-        topics = get_course_topics(
+        topics = get_course_topics_from_selected_concepts(
             course=course,
-            course_df=course_df,
             selected_concepts_file=selected_concepts_file,
         )
 
