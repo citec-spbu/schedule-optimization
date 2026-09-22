@@ -58,29 +58,16 @@ CER_OUTPUT_COLUMNS = [
 ]
 
 
-
 def normalize_rows(x: np.ndarray) -> np.ndarray:
     """
     Нормирует строки матрицы по L2-норме.
-    Нужно для вычисления cosine similarity через скалярное произведение.
+    После нормировки скалярное произведение двух векторов
+    соответствует cosine similarity.
     """
     x = np.asarray(x)
     norms = np.linalg.norm(x, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     return x / norms
-
-
-def normalize_vector(x: np.ndarray) -> np.ndarray:
-    """
-    Нормирует один вектор по L2-норме.
-    """
-    x = np.asarray(x)
-    norm = np.linalg.norm(x)
-
-    if norm == 0:
-        return x
-
-    return x / norm
 
 
 def make_ngrams(text: str, n: int = 10, step: int = 10) -> list[str]:
@@ -112,7 +99,8 @@ def normalize_text_for_cer(text: str) -> str:
 
 def cer(concept: str, chunks: list[str]) -> int:
     """
-    CER = число n-грамм описания, в которых напрямую встречается название понятия.
+    CER = число n-грамм описания,
+    в которых напрямую встречается название понятия.
     """
     concept = normalize_text_for_cer(concept)
 
@@ -132,16 +120,26 @@ def cer(concept: str, chunks: list[str]) -> int:
 
 def csr_from_embeddings(
     concept_emb: np.ndarray,
-    chunk_embs: np.ndarray,
+    description_emb: np.ndarray,
 ) -> float:
     """
-    CSR = сумма cosine similarity между эмбеддингом названия понятия и эмбеддингами всех n-грамм описания.
-    """
-    concept_emb = normalize_vector(concept_emb)
-    chunk_embs = normalize_rows(chunk_embs)
+    Вычисляет CSR как скалярное произведение:
 
-    sims = chunk_embs @ concept_emb
-    return float(sims.sum())
+        description_emb @ concept_emb
+
+    где:
+
+        description_emb = сумма L2-нормированных
+        эмбеддингов всех n-грамм описания;
+
+        concept_emb = L2-нормированный эмбеддинг
+        названия понятия.
+
+    Это эквивалентно:
+
+        sum_j cosine_similarity(chunk_j, concept)
+    """
+    return float(description_emb @ concept_emb)
 
 
 def load_json(path: str | Path) -> dict:
@@ -162,7 +160,8 @@ def filter_courses(
     courses_to_process: list[str] | None = None,
 ) -> dict:
     """
-    Оставляет только выбранные курсы, если courses_to_process не None.
+    Оставляет только выбранные курсы,
+    если courses_to_process не None.
     """
     if courses_to_process is None:
         return data
@@ -176,7 +175,8 @@ def filter_courses(
 
 def get_output_columns(calculate_cer: bool = False) -> list[str]:
     """
-    Возвращает фиксированный порядок колонок для итогового CSV.
+    Возвращает фиксированный порядок колонок
+    для итогового CSV.
     """
     columns = CSR_OUTPUT_COLUMNS.copy()
 
@@ -192,7 +192,8 @@ def build_topic_texts_by_course(
     courses_to_process: list[str] | None = None,
 ) -> tuple[dict[str, dict[str, str]], pd.DataFrame]:
     """
-    Собирает для выбранных понятий их заранее подготовленные описания.
+    Собирает для выбранных понятий
+    их заранее подготовленные описания.
 
     courses_topics.json имеет структуру:
         курс -> понятие -> описание
@@ -200,8 +201,9 @@ def build_topic_texts_by_course(
     selected_concepts.json имеет структуру:
         курс -> список понятий
 
-    Если для выбранного понятия нет готового описания в courses_topics.json,
-    оно записывается в missing_topics.csv.
+    Если для выбранного понятия нет готового описания
+    в courses_topics.json, оно записывается
+    в missing_topics.csv.
     """
     selected_concepts = filter_courses(
         selected_concepts,
@@ -262,11 +264,37 @@ def prepare_embeddings_for_course(
     step: int = 10,
     batch_size: int = 32,
     show_progress_bar: bool = True,
-) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict[str, list[str]]]:
+) -> tuple[
+    dict[str, np.ndarray],
+    dict[str, np.ndarray],
+    dict[str, list[str]],
+]:
     """
-    Предварительно считает эмбеддинги названий понятий и n-грамм описаний.
+    Предварительно считает:
+
+    1. L2-нормированные эмбеддинги названий понятий.
+    2. L2-нормированные эмбеддинги всех n-грамм.
+    3. Для каждого описания — сумму эмбеддингов его n-грамм.
+
+    Для понятия A:
+
+        description_emb[A]
+            = sum_j normalized_embedding(chunk_A_j)
+
+    Поэтому далее:
+
+        CSR(A, B)
+            = description_emb[A] @ topic_emb[B]
+
+    что эквивалентно:
+
+        sum_j cosine_similarity(chunk_A_j, B)
     """
     topics = list(topic_to_text.keys())
+
+    # ---------------------------------------------------------
+    # 1. Эмбеддинги названий понятий
+    # ---------------------------------------------------------
 
     topic_vectors = model.encode(
         topics,
@@ -275,10 +303,17 @@ def prepare_embeddings_for_course(
         convert_to_numpy=True,
     )
 
+    # Нормируем каждый embedding понятия один раз.
+    topic_vectors = normalize_rows(topic_vectors)
+
     topic_embs = {
         topic: topic_vectors[i]
         for i, topic in enumerate(topics)
     }
+
+    # ---------------------------------------------------------
+    # 2. Разбиение описаний на n-граммы
+    # ---------------------------------------------------------
 
     topic_chunks = {
         topic: make_ngrams(text, n=n, step=step)
@@ -293,6 +328,10 @@ def prepare_embeddings_for_course(
             all_chunks.append(chunk)
             chunk_owner.append(topic)
 
+    # ---------------------------------------------------------
+    # 3. Эмбеддинги всех n-грамм
+    # ---------------------------------------------------------
+
     all_chunk_vectors = model.encode(
         all_chunks,
         batch_size=batch_size,
@@ -300,9 +339,23 @@ def prepare_embeddings_for_course(
         convert_to_numpy=True,
     )
 
-    chunk_embs = {topic: [] for topic in topics}
+    # Каждый chunk embedding нормируем ровно один раз.
+    all_chunk_vectors = normalize_rows(all_chunk_vectors)
 
-    for owner, vector in zip(chunk_owner, all_chunk_vectors):
+    # ---------------------------------------------------------
+    # 4. Собираем нормированные embeddings n-грамм
+    #    отдельно для каждого понятия
+    # ---------------------------------------------------------
+
+    chunk_embs = {
+        topic: []
+        for topic in topics
+    }
+
+    for owner, vector in zip(
+        chunk_owner,
+        all_chunk_vectors,
+    ):
         chunk_embs[owner].append(vector)
 
     chunk_embs = {
@@ -310,7 +363,23 @@ def prepare_embeddings_for_course(
         for topic, vectors in chunk_embs.items()
     }
 
-    return topic_embs, chunk_embs, topic_chunks
+    # ---------------------------------------------------------
+    # 5. Для каждого описания складываем embeddings
+    #    всех его n-грамм.
+    #
+    # ВАЖНО:
+    # получившийся вектор повторно НЕ нормируется.
+    #
+    # description_emb[A]
+    #     = sum_j normalized_embedding(chunk_A_j)
+    # ---------------------------------------------------------
+
+    description_embs = {
+        topic: vectors.sum(axis=0)
+        for topic, vectors in chunk_embs.items()
+    }
+
+    return topic_embs, description_embs, topic_chunks
 
 
 def calculate_csr_for_course(
@@ -324,24 +393,47 @@ def calculate_csr_for_course(
     calculate_cer: bool = CALCULATE_CER,
 ) -> pd.DataFrame:
     """
-    Считает CSR для всех неупорядоченных пар понятий внутри одного курса.
+    Считает CSR для всех неупорядоченных пар понятий
+    внутри одного курса.
 
     Для пары (A, B) считаются два значения:
 
     csr_description_a_to_concept_b:
-        насколько описание A семантически связано с названием B
+        насколько описание A семантически связано
+        с названием B
 
     csr_description_b_to_concept_a:
-        насколько описание B семантически связано с названием A
+        насколько описание B семантически связано
+        с названием A
 
-    PRS = max(этих двух значений)
+    CSR вычисляется как:
 
-    Если calculate_cer=True, дополнительно считаются и сохраняются CER-значения.
+        CSR(A, B)
+            = sum_j cosine_similarity(chunk_A_j, B)
+
+    Для ускорения заранее вычисляется:
+
+        description_emb[A]
+            = sum_j normalized_embedding(chunk_A_j)
+
+    после чего:
+
+        CSR(A, B)
+            = description_emb[A] @ normalized_embedding(B)
+
+    PRS = max(CSR(A, B), CSR(B, A))
+
+    Если calculate_cer=True,
+    дополнительно считаются и сохраняются CER-значения.
     По умолчанию CER не считается.
     """
     topics = list(topic_to_text.keys())
 
-    topic_embs, topic_chunk_embs, topic_chunks = prepare_embeddings_for_course(
+    (
+        topic_embs,
+        description_embs,
+        topic_chunks,
+    ) = prepare_embeddings_for_course(
         topic_to_text=topic_to_text,
         model=model,
         n=n,
@@ -357,14 +449,16 @@ def calculate_csr_for_course(
             topic_a = topics[i]
             topic_b = topics[j]
 
+            # CSR(description(A) -> concept(B))
             score_ab = csr_from_embeddings(
                 concept_emb=topic_embs[topic_b],
-                chunk_embs=topic_chunk_embs[topic_a],
+                description_emb=description_embs[topic_a],
             )
 
+            # CSR(description(B) -> concept(A))
             score_ba = csr_from_embeddings(
                 concept_emb=topic_embs[topic_a],
-                chunk_embs=topic_chunk_embs[topic_b],
+                description_emb=description_embs[topic_b],
             )
 
             prs = max(score_ab, score_ba)
@@ -372,11 +466,17 @@ def calculate_csr_for_course(
             if score_ab >= score_ba:
                 max_csr_source_description = topic_a
                 max_csr_target_concept = topic_b
-                max_csr_direction = f"description({topic_a}) -> concept({topic_b})"
+                max_csr_direction = (
+                    f"description({topic_a}) -> "
+                    f"concept({topic_b})"
+                )
             else:
                 max_csr_source_description = topic_b
                 max_csr_target_concept = topic_a
-                max_csr_direction = f"description({topic_b}) -> concept({topic_a})"
+                max_csr_direction = (
+                    f"description({topic_b}) -> "
+                    f"concept({topic_a})"
+                )
 
             row = {
                 "course": course,
@@ -385,11 +485,16 @@ def calculate_csr_for_course(
                 "csr_description_a_to_concept_b": score_ab,
                 "csr_description_b_to_concept_a": score_ba,
                 "prs": prs,
-                "max_csr_source_description": max_csr_source_description,
-                "max_csr_target_concept": max_csr_target_concept,
-                "max_csr_direction": max_csr_direction,
-                "chunks_count_a": len(topic_chunks[topic_a]),
-                "chunks_count_b": len(topic_chunks[topic_b]),
+                "max_csr_source_description":
+                    max_csr_source_description,
+                "max_csr_target_concept":
+                    max_csr_target_concept,
+                "max_csr_direction":
+                    max_csr_direction,
+                "chunks_count_a":
+                    len(topic_chunks[topic_a]),
+                "chunks_count_b":
+                    len(topic_chunks[topic_b]),
                 "ngram_size": n,
                 "ngram_step": step,
                 "model": MODEL_NAME,
@@ -411,19 +516,31 @@ def calculate_csr_for_course(
                 if cer_ab >= cer_ba:
                     max_cer_source_description = topic_a
                     max_cer_target_concept = topic_b
-                    max_cer_direction = f"description({topic_a}) -> concept({topic_b})"
+                    max_cer_direction = (
+                        f"description({topic_a}) -> "
+                        f"concept({topic_b})"
+                    )
                 else:
                     max_cer_source_description = topic_b
                     max_cer_target_concept = topic_a
-                    max_cer_direction = f"description({topic_b}) -> concept({topic_a})"
+                    max_cer_direction = (
+                        f"description({topic_b}) -> "
+                        f"concept({topic_a})"
+                    )
 
                 row.update({
-                    "cer_description_a_to_concept_b": cer_ab,
-                    "cer_description_b_to_concept_a": cer_ba,
-                    "cer_prs": cer_prs,
-                    "max_cer_source_description": max_cer_source_description,
-                    "max_cer_target_concept": max_cer_target_concept,
-                    "max_cer_direction": max_cer_direction,
+                    "cer_description_a_to_concept_b":
+                        cer_ab,
+                    "cer_description_b_to_concept_a":
+                        cer_ba,
+                    "cer_prs":
+                        cer_prs,
+                    "max_cer_source_description":
+                        max_cer_source_description,
+                    "max_cer_target_concept":
+                        max_cer_target_concept,
+                    "max_cer_direction":
+                        max_cer_direction,
                 })
 
             rows.append(row)
@@ -436,7 +553,11 @@ def calculate_csr_for_course(
             ascending=[True, False],
         )
 
-        df = df.reindex(columns=get_output_columns(calculate_cer=calculate_cer))
+        df = df.reindex(
+            columns=get_output_columns(
+                calculate_cer=calculate_cer
+            )
+        )
 
     return df
 
@@ -452,7 +573,8 @@ def calculate_and_save_all_csr(
     calculate_cer: bool = CALCULATE_CER,
 ) -> pd.DataFrame:
     """
-    Считает CSR по всем курсам и сохраняет общий CSV-файл.
+    Считает CSR по всем курсам
+    и сохраняет общий CSV-файл.
     """
     all_dfs = []
 
@@ -480,36 +602,60 @@ def calculate_and_save_all_csr(
         all_dfs.append(csr_df)
 
     if all_dfs:
-        combined_df = pd.concat(all_dfs, ignore_index=True)
+        combined_df = pd.concat(
+            all_dfs,
+            ignore_index=True,
+        )
+
         combined_df = combined_df.sort_values(
             by=["course", "prs"],
             ascending=[True, False],
         )
 
         combined_df = combined_df.reindex(
-            columns=get_output_columns(calculate_cer=calculate_cer)
+            columns=get_output_columns(
+                calculate_cer=calculate_cer
+            )
         )
     else:
         combined_df = pd.DataFrame(
-            columns=get_output_columns(calculate_cer=calculate_cer)
+            columns=get_output_columns(
+                calculate_cer=calculate_cer
+            )
         )
 
     output_file = Path(output_file)
-    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    combined_df.to_csv(output_file, index=False, encoding="utf-8-sig")
+    combined_df.to_csv(
+        output_file,
+        index=False,
+        encoding="utf-8-sig",
+    )
 
     print("\n" + "=" * 80)
-    print(f"CSR сохранён в файл: {output_file.resolve()}")
-    print(f"Всего строк с парами понятий: {len(combined_df)}")
+    print(
+        f"CSR сохранён в файл: "
+        f"{output_file.resolve()}"
+    )
+    print(
+        f"Всего строк с парами понятий: "
+        f"{len(combined_df)}"
+    )
     print("=" * 80)
 
     return combined_df
 
 
-def print_dataset_statistics(csr_df: pd.DataFrame) -> None:
+def print_dataset_statistics(
+    csr_df: pd.DataFrame,
+) -> None:
     """
-    Печатает краткую статистику по рассчитанному CSR-файлу.
+    Печатает краткую статистику
+    по рассчитанному CSR-файлу.
     """
     if csr_df.empty:
         print("CSR-таблица пустая.")
@@ -519,14 +665,22 @@ def print_dataset_statistics(csr_df: pd.DataFrame) -> None:
     print("Статистика рассчитанных пар:")
 
     for course, course_df in csr_df.groupby("course"):
-        topics_count = len(set(course_df["topic_a"]).union(set(course_df["topic_b"])))
+        topics_count = len(
+            set(course_df["topic_a"]).union(
+                set(course_df["topic_b"])
+            )
+        )
+
         pairs_count = len(course_df)
 
-        print(f"{course}: понятий = {topics_count}, пар = {pairs_count}")
+        print(
+            f"{course}: "
+            f"понятий = {topics_count}, "
+            f"пар = {pairs_count}"
+        )
 
     print(f"Всего пар: {len(csr_df)}")
     print("=" * 80)
-
 
 
 def run_from_json_files(
@@ -540,24 +694,46 @@ def run_from_json_files(
     """
     Основной сценарий:
 
-    1. Загрузить courses_topics.json с готовыми описаниями понятий.
-    2. Загрузить selected_concepts.json со списком обрабатываемых понятий.
-    3. Собрать готовые описания для выбранных понятий.
-    4. Рассчитать CSR/PRS.
-    5. Сохранить CSR/PRS в csr_scores.csv.
-    """
-    courses_topics = load_json(courses_topics_file)
-    selected_concepts = load_json(selected_concepts_file)
+    1. Загрузить courses_topics.json
+       с готовыми описаниями понятий.
 
-    topic_texts_by_course, missing_df = build_topic_texts_by_course(
+    2. Загрузить selected_concepts.json
+       со списком обрабатываемых понятий.
+
+    3. Собрать готовые описания
+       для выбранных понятий.
+
+    4. Рассчитать CSR/PRS.
+
+    5. Сохранить CSR/PRS
+       в csr_scores.csv.
+    """
+    courses_topics = load_json(
+        courses_topics_file
+    )
+
+    selected_concepts = load_json(
+        selected_concepts_file
+    )
+
+    (
+        topic_texts_by_course,
+        missing_df,
+    ) = build_topic_texts_by_course(
         courses_topics=courses_topics,
         selected_concepts=selected_concepts,
         courses_to_process=courses_to_process,
     )
 
     if not missing_df.empty:
-        missing_topics_file = Path(missing_topics_file)
-        missing_topics_file.parent.mkdir(parents=True, exist_ok=True)
+        missing_topics_file = Path(
+            missing_topics_file
+        )
+
+        missing_topics_file.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
         missing_df.to_csv(
             missing_topics_file,
@@ -566,11 +742,18 @@ def run_from_json_files(
         )
 
         print("\n" + "=" * 80)
-        print(f"Есть темы без найденных описаний. Они сохранены в файл: {missing_topics_file.resolve()}")
+        print(
+            "Есть темы без найденных описаний. "
+            "Они сохранены в файл: "
+            f"{missing_topics_file.resolve()}"
+        )
         print("=" * 80)
 
     if not topic_texts_by_course:
-        raise ValueError("Не найдено ни одного курса с описаниями выбранных понятий.")
+        raise ValueError(
+            "Не найдено ни одного курса "
+            "с описаниями выбранных понятий."
+        )
 
     csr_df = calculate_and_save_all_csr(
         topic_texts_by_course=topic_texts_by_course,
